@@ -1,3 +1,5 @@
-# Simple Starter
+# gen-109
 
-Simple JS build starter for simple, client-only demos.
+Color interpolation experiments. Creates a base voronoi diagram and recursively add new spectral.js interpolated in-between points in different
+detail levels to generate a second final voronoi that actually gets painted.
+
