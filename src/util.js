@@ -1,6 +1,6 @@
-export function clamp(v)
+export function clamp(v, max = 1)
 {
-    return v < 0 ? 0 : v > 1 ? 1 : v;
+    return v < 0 ? 0 : v > max ? max : v;
 }
 
 

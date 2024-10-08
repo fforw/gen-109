@@ -1,14 +1,20 @@
 import domready from "domready"
 import "./style.css"
 import { voronoi } from "d3-voronoi"
-import { polygonCentroid } from "d3-polygon"
+import { sutherlandHodgeman } from "@thi.ng/geom-clip"
+import { polygonCentroid, polygonArea } from "d3-polygon"
+import spectral from "spectral.js"
+import { createNoise2D } from "simplex-noise"
+import { canvasRGBA } from "stackblur-canvas"
 import { allPalettesWithBlack } from "./randomPalette"
 import { rndFromArray } from "./util"
-import spectral from "spectral.js"
+import { easeOutQuad } from "./easing"
 
 const PHI = (1 + Math.sqrt(5)) / 2;
 const TAU = Math.PI * 2;
 const DEG2RAD_FACTOR = TAU / 360;
+
+const overdraw = 1.5
 
 const config = {
     width: 0,
@@ -20,6 +26,7 @@ const config = {
  */
 let ctx;
 let canvas;
+let noise;
 
 function relax(v, pts, count = 5)
 {
@@ -33,6 +40,20 @@ function relax(v, pts, count = 5)
         })
     }
     return pts
+}
+
+function createTemp(width = config.width, height = config.height)
+{
+    const canvas = document.createElement("canvas")
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext("2d")
+
+    ctx.fillStyle = "#000"
+    ctx.fillRect(0, 0, width, height)
+
+    return ctx
 }
 
 function drawPolygon(ctx, polygon)
@@ -57,8 +78,6 @@ function drawPolygon(ctx, polygon)
     ctx.fill()
     ctx.stroke()
 }
-
-const overdraw = 1.5
 
 
 function getPair(palette)
@@ -105,17 +124,19 @@ function createRandomColors(palette, count = 10)
 }
 
 
-function touchesScreen(tri)
+function touchesScreen(polygon)
 {
     const { width, height } = config
 
-    const [[x0,y0],[x1,y1],[x2,y2]] = tri
-
-    return (
-        (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) ||
-        (x1 >= 0 && x1 < width && y1 >= 0 && y1 < height) ||
-        (x2 >= 0 && x2 < width && y2 >= 0 && y2 < height)
-    )
+    for (let i = 0; i < polygon.length; i++)
+    {
+        const [x, y] = polygon[i]
+        if (x >= 0 && x < width && y >= 0 && y < height)
+        {
+            return true
+        }
+    }
+    return false
 }
 
 function findIndex(pts, pt)
@@ -132,15 +153,40 @@ function findIndex(pts, pt)
 }
 
 
-function randomColorPos()
+const ns = 0.15
+
+function randomColorPos(pt, flip)
 {
-    return 0.25 + Math.random() * 0.5
+    const [x,y] = pt
+
+    let v = 0.15 + (0.5 + 0.5 * noise(x * ns, y * ns))  * 0.7
+
+    if (flip)
+    {
+        v = 1 - v
+    }
+    return v
 }
 
+function getOrder(x0,y0,x1,y1)
+{
+    return Math.atan2(y1-y0,x0-y1) < 0
+}
 
+/**
+ * Recursive interpolation of color positions
+ *
+ * @param {Array<Array<number>>} pts    Array of all positions (each is a 2 element array)
+ * @param {Array<string>} colors        Array of all colors (each is a color)
+ * @param {Array<Array<number>>} tri    Array of the current triangle coordinates
+ * @param {Array<string>} triColors     Array of colors for the current triangle
+ * @param {number} level                current dept, approaches and stops at 0
+ */
 function interpolate(pts,colors, tri, triColors, level)
 {
     const [pt0,pt1,pt2] = tri
+
+    // see /tri-interpolate.png 
 
     const [x0,y0] = pt0
     const [x1,y1] = pt1
@@ -160,9 +206,15 @@ function interpolate(pts,colors, tri, triColors, level)
     const color0 = triColors[0]
     const color1 = triColors[1]
     const color2 = triColors[2]
-    const color3 = spectral.mix(color0, color1, randomColorPos(), spectral.HEX)
-    const color4 = spectral.mix(color1, color2, randomColorPos(), spectral.HEX)
-    const color5 = spectral.mix(color2, color0, randomColorPos(), spectral.HEX)
+
+    const order3 = getOrder(x0,y0,x1,y1)
+    const order4 = getOrder(x1,y1,x2,y2)
+    const order5 = getOrder(x2,y2,x0,y0)
+
+
+    const color3 = spectral.mix(color0, color1, randomColorPos(pt3, order3), spectral.HEX)
+    const color4 = spectral.mix(color1, color2, randomColorPos(pt4, order4), spectral.HEX)
+    const color5 = spectral.mix(color2, color0, randomColorPos(pt5, order5), spectral.HEX)
 
     pts.push(
         [x3,y3],
@@ -240,6 +292,134 @@ function interpolate(pts,colors, tri, triColors, level)
 }
 
 
+function transferAlpha(ctx, maskCtx)
+{
+    const { width, height } = config
+
+    const imageData = ctx.getImageData(0,0,width,height)
+    const maskData = maskCtx.getImageData(0,0,width,height)
+
+    const { data } = imageData
+    const { data : mask } = maskData
+
+    let off = 0
+    for (let y = 0; y < height; y++)
+    {
+        for (let x = 0; x < width; x++)
+        {
+            data[off + 3] = mask[off + 1]
+            off += 4
+        }
+    }
+    ctx.putImageData(imageData, 0, 0)
+}
+
+
+function getMinMax(array)
+{
+    let min = Infinity, max = -Infinity
+    for (let i = 0; i < array.length; i++)
+    {
+        const value = array[i]
+
+        if (value < min)
+        {
+            min = value
+        }
+        if (value > max)
+        {
+            max = value
+        }
+    }
+    return [min,max]
+
+}
+
+function clipPolygons(polygons, colors)
+{
+    const polygonsOut = []
+    const colorsOut = []
+    const areasOut = []
+
+    const screen = getScreenPolygon()
+
+    for (let i = 0; i < polygons.length; i++)
+    {
+        const polygon = polygons[i]
+
+        const result = polygon ? sutherlandHodgeman(polygon, screen) : []
+        
+        if (result.length)
+        {
+            const area = polygonArea(result)
+            if (area > 1)
+            {
+                polygonsOut.push(result)
+                colorsOut.push(colors[i])
+                areasOut.push(area)
+            }
+        }
+    }
+
+    return [polygonsOut, colorsOut,areasOut]
+
+}
+
+
+function getScreenPolygon()
+{
+    const { width, height } = config
+
+    return [
+        [0,0],
+        [width,0],
+        [width,height],
+        [0,height]
+    ]
+}
+
+
+function getArea(tri)
+{
+    const [[x1,y1],[x2,y2],[x3,y3]] = tri
+
+    return 0.5 * Math.abs(x1 * (y2 - y3) + x2 * (y3 - y1) + x3 *(y1 - y2))
+}
+
+function getMinHeight(tri)
+{
+    const area = getArea(tri)
+
+    let min = Infinity
+    // h = a / (0.5 * base)
+
+    const length = tri.length
+    let [x0,y0] = tri[length - 1]
+    for (let i = 0; i < length; i++)
+    {
+        const [x1, y1] = tri[i]
+        const h = area / (0.5 * distance(x0,y0,x1,y1))
+
+        if (h < min)
+        {
+            min = h
+        }
+
+        x0 = x1
+        y0 = y1
+    }
+    return min;
+}
+
+
+function distance(x0, y0, x1, y1)
+{
+    const dx = x1 - x0
+    const dy = y1 - y0
+    return Math.sqrt(dx * dx + dy * dy)
+}
+
+
 domready(
     () => {
 
@@ -257,6 +437,8 @@ domready(
 
         const paint = () => {
 
+            noise = createNoise2D()
+
             ctx.fillStyle = "#000";
             ctx.fillRect(0,0, width, height);
 
@@ -266,19 +448,36 @@ domready(
 
             const palette = rndFromArray(allPalettesWithBlack)
 
-            const count = Math.floor(width * overdraw * overdraw * height/150000)
+            const variance = 0.2 + Math.pow(Math.random(),2) * 1.4
+            const count = Math.floor(width * overdraw * overdraw * height/(150000*variance))
 
             let [pts, colors] = createRandomColors(palette, count)
+
+            pts = relax(v, pts, 1)
+
+            const power = 0.1 + Math.random() * 2
 
             let diagram = v(pts)
 
             let triangles = diagram.triangles()
             let drawn = 0, culled = 0
+            let minSplits = Infinity, maxSplits = -Infinity
             triangles.forEach(tri => {
 
                 if (touchesScreen(tri))
                 {
-                    const numSplits = 4 + Math.floor(Math.pow(Math.random(),0.5) * 2)
+                    const h = getMinHeight(tri)
+
+                    const numSplits = 2 + Math.floor(Math.pow(Math.random(),power) * Math.log2(h) - 2)
+
+                    if (numSplits < minSplits)
+                    {
+                        minSplits = numSplits
+                    }
+                    if (numSplits > maxSplits)
+                    {
+                        maxSplits = numSplits
+                    }
 
                     if (numSplits > 0)
                     {
@@ -291,7 +490,10 @@ domready(
                     culled++
                 }
             })
-            console.log("TRI", triangles.length, "drawn = ", drawn, ", culled = ", culled)
+
+
+            console.log("TRI", triangles.length, "drawn = ", drawn, ", culled = ", culled, ", minSplits = ", minSplits, ", maxSplits = ", maxSplits)
+
 
             // for (let i = 0; i < pts.length; i++)
             // {
@@ -302,14 +504,50 @@ domready(
             //
             // }
 
+
             diagram = v(pts)
-            diagram.polygons().forEach(
+            let polys = diagram.polygons()
+
+            const [polygons, cols, polygonAreas] = clipPolygons(polys, colors)
+
+            const [minArea, maxArea] = getMinMax(polygonAreas)
+
+            console.log({minArea,maxArea})
+
+            const maskCtx = createTemp()
+            polygons.forEach(
                 (p, idx) => {
-                    ctx.fillStyle = colors[idx]
-                    ctx.strokeStyle = colors[idx]
+
+                    let value = (polygonAreas[idx] - minArea) / (maxArea - minArea)
+
+                    value = Math.floor(easeOutQuad(value) * 255)
+                    const color = `rgb(${value},${value},${value})`
+
+                    maskCtx.fillStyle = color
+                    maskCtx.strokeStyle = color
+                    maskCtx.lineWidth = 2
+                    drawPolygon(maskCtx, p)
+                })
+            canvasRGBA(maskCtx.canvas, 0,0,width,height, 100)
+            //dither(maskCtx, 200)
+
+            polygons.forEach(
+                (p, idx) => {
+                    ctx.fillStyle = cols[idx]
+                    ctx.strokeStyle = cols[idx]
                     ctx.lineWidth = 2
                     drawPolygon(ctx, p)
                 })
+
+            const blurCtx = createTemp()
+            blurCtx.drawImage(ctx.canvas, 0, 0, width, height)
+            canvasRGBA(blurCtx.canvas, 0,0,width,height, 100)
+            //dither(blurCtx, 100)
+
+            transferAlpha(blurCtx, maskCtx)
+            //ctx.drawImage(maskCtx.canvas, 0, 0, width, height)
+            ctx.drawImage(blurCtx.canvas, 0, 0)
+
         }
 
         paint()
